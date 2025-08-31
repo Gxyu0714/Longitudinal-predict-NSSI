@@ -1,9 +1,21 @@
 """
-Longitudinal Prediction of Non-Suicidal Self-Injury (NSSI) Among Chinese Adolescents
-====================================================================================
+Longitudinal Prediction Framework for N-Wave Cohort Survey Data
+===============================================================
 
-This script demonstrates the complete workflow for predicting NSSI using machine learning approaches
-on longitudinal data from Chinese adolescents.
+A flexible framework for predicting outcomes using machine learning approaches
+on longitudinal data from multi-wave cohort studies.
+
+This implementation supports:
+- N-wave longitudinal data processing
+- Multiple prediction models
+- Time-aware cross-validation strategies
+- Feature selection techniques
+- Comprehensive evaluation metrics
+
+Based on the methodology from:
+Guo, X., Liu, S., Jiang, L., Xiong, Z., Wang, L., Lu, L., Li, X., Zhao, L., & Shek, D. T. L. (2025). 
+Longitudinal machine learning prediction of non-suicidal self-injury among Chinese adolescents: 
+A prospective multicenter Cohort study. Journal of Affective Disorders, 120110.
 
 Author: Xinyu Guo
 Date: August 2025
@@ -13,241 +25,673 @@ import pandas as pd
 import numpy as np
 from sklearn.impute import KNNImputer
 from sklearn.preprocessing import StandardScaler
+from sklearn.feature_selection import SelectKBest, f_classif
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.linear_model import LogisticRegression
+from sklearn.svm import SVC
 from sklearn.metrics import roc_auc_score, precision_recall_curve, auc
 from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
+from sklearn.model_selection import StratifiedKFold
 import warnings
 warnings.filterwarnings('ignore')
+
+# ============================================================================
+# CONFIGURATION
+# ============================================================================
+
+class Config:
+    """Configuration parameters for the prediction framework."""
+    
+    # Data parameters
+    WAVE_PREFIX = 'T'  # Prefix for time wave columns
+    ID_COLUMN = 'ID'   # Identifier column name
+    WAVE_COLUMN = 'wave'  # Wave indicator column name
+    
+    # Target variable
+    TARGET_VAR = 'NSSI'  # Binary outcome variable
+    
+    # Model parameters
+    N_FEATURES = 50  # Number of features to select
+    RANDOM_STATE = 42  # Random seed for reproducibility
+    
+    # Cross-validation parameters
+    CV_FOLDS = 5  # Number of cross-validation folds
 
 # ============================================================================
 # DATA PROCESSING PIPELINE
 # ============================================================================
 
-def load_and_transform_data():
+class LongitudinalDataProcessor:
     """
-    Load wide-format data and transform to long-format for longitudinal analysis.
+    Process and clean longitudinal cohort survey data.
     
-    Expected input format:
-    - Wide format with variables prefixed by time wave (T1_, T2_, T3_, T4_)
-    - Each row represents one individual across all time waves
+    Handles:
+    - Data transformation from wide to long format
+    - Missing value imputation
+    - Variable standardization
+    - Quality control checks
     """
-    print("Step 1: Loading and transforming data...")
     
-    # In practice, you would load your actual data here:
-    # df = pd.read_csv('your_data_file.csv')
+    def __init__(self, config=Config):
+        self.config = config
+        self.scaler = StandardScaler()
+        self.imputer = KNNImputer(n_neighbors=5)
+        self.feature_selector = SelectKBest(score_func=f_classif, k=config.N_FEATURES)
+        
+    def load_and_transform_data(self, file_path):
+        """
+        Load wide-format data and transform to long-format.
+        
+        Args:
+            file_path (str): Path to the input CSV file
+            
+        Returns:
+            pd.DataFrame: Transformed long-format data
+        """
+        print("Step 1: Loading and transforming data...")
+        
+        # Load data
+        df = pd.read_csv(file_path)
+        print(f"Loaded data with shape: {df.shape}")
+        
+        # Identify time-varying variables
+        columns = df.columns.tolist()
+        base_vars = set()
+        for col in columns:
+            if col != self.config.ID_COLUMN and col.startswith(self.config.WAVE_PREFIX):
+                base_vars.add(col[3:])  # Remove Tx_ prefix
+        
+        print(f"Identified {len(base_vars)} base variables")
+        
+        # Transform to long format
+        long_data = []
+        for _, row in df.iterrows():
+            for wave in range(1, 5):  # Assuming T1, T2, T3, T4
+                time_prefix = f"{self.config.WAVE_PREFIX}{wave}_"
+                new_row = {
+                    self.config.ID_COLUMN: row[self.config.ID_COLUMN],
+                    self.config.WAVE_COLUMN: wave
+                }
+                
+                for base_var in base_vars:
+                    original_var = f"{time_prefix}{base_var}"
+                    if original_var in row:
+                        new_row[base_var] = row[original_var]
+                
+                long_data.append(new_row)
+        
+        long_df = pd.DataFrame(long_data)
+        
+        # Reorder columns
+        cols = long_df.columns.tolist()
+        cols.remove(self.config.ID_COLUMN)
+        cols.remove(self.config.WAVE_COLUMN)
+        cols = [self.config.ID_COLUMN, self.config.WAVE_COLUMN] + sorted(cols)
+        long_df = long_df[cols]
+        
+        print(f"Transformed data shape: {long_df.shape}")
+        return long_df
     
-    # For demonstration, we'll simulate the structure:
-    print("Data loaded successfully.")
-    print("Transforming from wide to long format...")
+    def clean_and_process_target(self, df):
+        """
+        Clean data and process target variable.
+        
+        Args:
+            df (pd.DataFrame): Input long-format data
+            
+        Returns:
+            pd.DataFrame: Cleaned data with processed target variable
+        """
+        print("\nStep 2: Cleaning data and processing target variable...")
+        
+        # Remove observations with missing target values
+        initial_count = len(df)
+        df_clean = df.dropna(subset=[self.config.TARGET_VAR])
+        final_count = len(df_clean)
+        
+        print(f"Removed {initial_count - final_count} observations with missing target values")
+        
+        # Convert target to binary if needed
+        if df_clean[self.config.TARGET_VAR].dtype != 'int64':
+            df_clean[self.config.TARGET_VAR] = (
+                df_clean[self.config.TARGET_VAR] > 0
+            ).astype(int)
+        
+        print(f"Target variable distribution:")
+        print(df_clean[self.config.TARGET_VAR].value_counts())
+        
+        return df_clean
     
-    # This would contain the actual transformation code:
-    # - Extract base variable names
-    # - Reshape data from wide to long format
-    # - Save transformed data
+    def fill_missing_values(self, df):
+        """
+        Fill missing values using appropriate methods.
+        
+        Args:
+            df (pd.DataFrame): Input data with missing values
+            
+        Returns:
+            pd.DataFrame: Data with filled missing values
+        """
+        print("\nStep 3: Filling missing values...")
+        
+        # Separate variable types
+        numeric_vars = df.select_dtypes(include=[np.number]).columns.tolist()
+        categorical_vars = df.select_dtypes(include=['object']).columns.tolist()
+        
+        # Remove ID and wave columns from processing
+        numeric_vars = [var for var in numeric_vars 
+                       if var not in [self.config.ID_COLUMN, self.config.WAVE_COLUMN]]
+        categorical_vars = [var for var in categorical_vars 
+                           if var not in [self.config.ID_COLUMN, self.config.WAVE_COLUMN]]
+        
+        print(f"Processing {len(numeric_vars)} numeric variables")
+        print(f"Processing {len(categorical_vars)} categorical variables")
+        
+        # Fill missing values for numeric variables using KNN imputation
+        if numeric_vars:
+            df_numeric = df[numeric_vars].copy()
+            df_numeric_imputed = pd.DataFrame(
+                self.imputer.fit_transform(df_numeric),
+                columns=numeric_vars,
+                index=df.index
+            )
+            df[numeric_vars] = df_numeric_imputed
+        
+        # Fill missing values for categorical variables using mode imputation
+        if categorical_vars:
+            for var in categorical_vars:
+                mode_value = df[var].mode()
+                if len(mode_value) > 0:
+                    df[var] = df[var].fillna(mode_value[0])
+        
+        # Report missing value status
+        missing_after = df.isnull().sum().sum()
+        print(f"Remaining missing values: {missing_after}")
+        
+        return df
     
-    print("Data transformation completed.")
-
-def clean_and_process_nssi():
-    """
-    Clean data and process NSSI variable.
-    
-    Steps:
-    1. Remove observations with missing DSH values
-    2. Convert DSH to binary NSSI variable (0/1)
-    3. Filter out specific grade levels (grades 1 and 2 in first wave)
-    """
-    print("\nStep 2: Cleaning data and processing NSSI variable...")
-    
-    # Load transformed long-format data
-    # df = pd.read_csv('T1234_predict_long.csv')
-    
-    # Remove observations with missing DSH values
-    print("Removing observations with missing DSH values...")
-    
-    # Convert DSH to binary NSSI variable
-    print("Converting DSH to binary NSSI variable...")
-    
-    # Filter out grades 1 and 2 from first wave
-    print("Filtering out grades 1 and 2 from first wave...")
-    
-    print("Data cleaning and NSSI processing completed.")
-
-def fill_missing_values():
-    """
-    Fill missing values using appropriate methods for different variable types.
-    
-    Methods:
-    - For Age and Grade: Use temporal rules (T1=T2, T3=T1+1, T4=T1+2)
-    - For other continuous variables: Forward fill then backward fill
-    - For categorical variables: Mode imputation by wave
-    """
-    print("\nStep 3: Filling missing values...")
-    
-    # Load cleaned data
-    # df = pd.read_csv('T1234_predict_long_cleaned.csv')
-    
-    print("Applying temporal filling rules for Age and Grade...")
-    print("Using forward/backward fill for other continuous variables...")
-    print("Applying mode imputation for categorical variables...")
-    
-    print("Missing value filling completed.")
-
-def impute_remaining_missing():
-    """
-    Impute remaining missing values using advanced techniques.
-    
-    Methods:
-    - Continuous variables: KNN imputation
-    - Categorical variables: Mode imputation by wave
-    """
-    print("\nStep 4: Advanced imputation of remaining missing values...")
-    
-    # Load partially filled data
-    # df = pd.read_csv('T1234_predict_long_cleaned.csv')
-    
-    # Separate variable types
-    continuous_vars = ['AA', 'BC', 'BF', 'BO', 'CBC', 'CBCL_AB', 'CBCL_AD', 'CBCL_AP',
-                       'CBCL_Exter', 'CBCL_Inter', 'CBCL_RB', 'CBCL_SC', 'CBCL_SP',
-                       'CBCL_Sex', 'CBCL_TP', 'CBCL_Total', 'CBCL_WD', 'CC',
-                       'CESD_score', 'CH', 'CRIES_COVID', 'Com', 'DBP', 'DE', 'EC',
-                       'EG', 'EP', 'FFT', 'Gen', 'Height', 'IAT20_score',
-                       'IAT_Prof.Shek', 'LS', 'MC', 'MT', 'Mut', 'PA', 'PB', 'PCC',
-                       'PCT', 'PI', 'PIT', 'PN', 'PR', 'RE', 'SAS_Ori', 'SB', 'SBP',
-                       'SC', 'SCARED_score', 'SD', 'SDS_Ori', 'SE', 'SI', 'SP',
-                       'Sep', 'Soc', 'Som', 'TPYD', 'UCVA_left', 'UCVA_right',
-                       'VC', 'Weight', 'fa_BMI', 'income_mon', 'mo_BMI']
-    
-    categorical_vars = ['Age', 'CBCL_Sex', 'IV', 'Nationality', 'Region', 'SE',
-                        'Sch', 'UV', 'fa_edu', 'fa_work', 'mo_edu', 'mo_work',
-                        'onlychild']
-    
-    print("Identified continuous variables:", len(continuous_vars))
-    print("Identified categorical variables:", len(categorical_vars))
-    
-    # Apply KNN imputation for continuous variables
-    print("Applying KNN imputation for continuous variables...")
-    
-    # Apply mode imputation for categorical variables
-    print("Applying mode imputation for categorical variables...")
-    
-    print("Advanced imputation completed.")
+    def standardize_features(self, df, fit_transform=True):
+        """
+        Standardize continuous features.
+        
+        Args:
+            df (pd.DataFrame): Input data
+            fit_transform (bool): Whether to fit the scaler or just transform
+            
+        Returns:
+            pd.DataFrame: Data with standardized features
+        """
+        print("\nStep 4: Standardizing features...")
+        
+        # Identify continuous variables (excluding ID, wave, and target)
+        exclude_vars = [self.config.ID_COLUMN, self.config.WAVE_COLUMN, self.config.TARGET_VAR]
+        continuous_vars = [col for col in df.columns 
+                         if col not in exclude_vars and df[col].dtype in ['float64', 'int64']]
+        
+        print(f"Standardizing {len(continuous_vars)} continuous variables")
+        
+        # Standardize features
+        if fit_transform:
+            df_continuous_scaled = pd.DataFrame(
+                self.scaler.fit_transform(df[continuous_vars]),
+                columns=continuous_vars,
+                index=df.index
+            )
+        else:
+            df_continuous_scaled = pd.DataFrame(
+                self.scaler.transform(df[continuous_vars]),
+                columns=continuous_vars,
+                index=df.index
+            )
+        
+        df[continuous_vars] = df_continuous_scaled
+        
+        return df
 
 # ============================================================================
-# PREDICTION MODELING PIPELINE
+# FEATURE SELECTION
 # ============================================================================
 
-def prepare_features_for_modeling():
+class FeatureSelector:
     """
-    Prepare features for modeling.
-    
-    Steps:
-    1. Select relevant features
-    2. Standardize continuous variables
-    3. Encode categorical variables
+    Select relevant features for prediction using statistical methods.
     """
-    print("\nStep 5: Preparing features for modeling...")
     
-    # Load fully processed data
-    # df = pd.read_csv('T1234_predict_long_final.csv')
+    def __init__(self, config=Config):
+        self.config = config
+        self.selector = SelectKBest(score_func=f_classif, k=config.N_FEATURES)
+        self.selected_features = None
     
-    # Define selected features (example)
-    selected_features = [
-        'Age', 'Gender', 'Grade', 'BMI', 'Nationality', 'Region',
-        'CBCL_AP', 'CBCL_Exter', 'CBCL_Inter', 'CBCL_SP', 'CBCL_Sex', 'CBCL_TP',
-        'CESD_score', 'CRIES_COVID', 'FFT', 'IAT20_score', 'IAT_Prof.Shek', 'LS',
-        'SCARED_score', 'DE', 'MT', 'EG', 'EP', 'IV', 'UV', 'AA', 'SDS_Ori', 'SAS_Ori',
-        'BO', 'RE', 'SC', 'PB', 'EC', 'CC', 'BC', 'MC', 'SD', 'SE', 'SI', 'BF', 'PI',
-        'PN', 'SP', 'UCVA_left', 'UCVA_right', 'VC', 'fa_BMI', 'fa_edu', 'fa_h', 'fa_w',
-        'fa_work', 'income_mon', 'mo_BMI', 'mo_edu', 'mo_h', 'mo_w', 'mo_work',
-        'onlychild', 'pinM_week', 're_child', 're_par', 'SB'
-    ]
-    
-    print(f"Selected {len(selected_features)} features for modeling")
-    
-    # Standardize features
-    print("Standardizing continuous features...")
-    
-    # Encode categorical features
-    print("Encoding categorical features...")
-    
-    print("Feature preparation completed.")
+    def select_features(self, X, y):
+        """
+        Select top K features based on ANOVA F-scores.
+        
+        Args:
+            X (pd.DataFrame): Feature matrix
+            y (pd.Series): Target variable
+            
+        Returns:
+            pd.DataFrame: Selected features
+        """
+        print(f"\nSelecting top {self.config.N_FEATURES} features...")
+        
+        # Fit feature selector
+        self.selector.fit(X, y)
+        
+        # Get selected feature indices
+        selected_indices = self.selector.get_support(indices=True)
+        self.selected_features = X.columns[selected_indices].tolist()
+        
+        # Transform features
+        X_selected = self.selector.transform(X)
+        X_selected_df = pd.DataFrame(
+            X_selected,
+            columns=self.selected_features,
+            index=X.index
+        )
+        
+        print(f"Selected features: {self.selected_features[:10]}...")
+        
+        return X_selected_df
 
-def lstm_temporal_feature_selection():
-    """
-    Use LSTM to select temporally relevant features.
-    
-    This approach considers the temporal patterns in longitudinal data
-    to identify features that are most predictive over time.
-    """
-    print("\nStep 6: LSTM temporal feature selection...")
-    
-    # This would involve:
-    # 1. Reshape data for LSTM input (samples, timesteps, features)
-    # 2. Train LSTM model to identify important temporal patterns
-    # 3. Extract feature importance based on LSTM weights
-    
-    print("LSTM temporal feature selection completed.")
+# ============================================================================
+# PREDICTION MODELS
+# ============================================================================
 
-def random_forest_classification():
+class PredictionModels:
     """
-    Train Random Forest classifier for NSSI prediction.
-    
-    Uses features selected by LSTM temporal analysis.
+    Collection of prediction models for longitudinal data.
     """
-    print("\nStep 7: Random Forest classification...")
     
-    # Load prepared features and target variable
-    # X, y = prepare_features_and_target()
+    def __init__(self, config=Config):
+        self.config = config
+        self.models = {
+            'random_forest': RandomForestClassifier(
+                n_estimators=100,
+                random_state=config.RANDOM_STATE,
+                n_jobs=-1
+            ),
+            'logistic_regression': LogisticRegression(
+                random_state=config.RANDOM_STATE,
+                max_iter=1000
+            ),
+            'svm': SVC(
+                probability=True,
+                random_state=config.RANDOM_STATE
+            )
+        }
+        self.trained_models = {}
     
-    # Train Random Forest model
-    print("Training Random Forest classifier...")
+    def train_models(self, X, y):
+        """
+        Train all prediction models.
+        
+        Args:
+            X (pd.DataFrame): Feature matrix
+            y (pd.Series): Target variable
+        """
+        print("\nTraining prediction models...")
+        
+        for name, model in self.models.items():
+            print(f"Training {name}...")
+            model.fit(X, y)
+            self.trained_models[name] = model
     
-    # Evaluate model performance
-    print("Evaluating model performance...")
-    
-    print("Random Forest classification completed.")
+    def predict(self, X, model_name=None):
+        """
+        Make predictions using trained models.
+        
+        Args:
+            X (pd.DataFrame): Feature matrix
+            model_name (str): Specific model to use (None for all)
+            
+        Returns:
+            dict: Predictions from each model
+        """
+        predictions = {}
+        
+        if model_name:
+            models_to_use = {model_name: self.trained_models[model_name]}
+        else:
+            models_to_use = self.trained_models
+        
+        for name, model in models_to_use.items():
+            predictions[f"{name}_pred"] = model.predict(X)
+            predictions[f"{name}_prob"] = model.predict_proba(X)[:, 1]
+        
+        return predictions
 
-def time_cross_validation():
-    """
-    Perform time-aware cross-validation.
-    
-    Schemes:
-    1. Fixed split: Use early waves for training, later waves for testing
-    2. Sliding window: Train on consecutive waves, test on next wave
-    3. Cumulative learning: Accumulate data over time for training
-    """
-    print("\nStep 8: Time cross-validation...")
-    
-    # Scheme 1: Fixed split
-    print("Performing fixed split validation...")
-    
-    # Scheme 2: Sliding window
-    print("Performing sliding window validation...")
-    
-    # Scheme 3: Cumulative learning
-    print("Performing cumulative learning validation...")
-    
-    print("Time cross-validation completed.")
+# ============================================================================
+# TIME-AWARE CROSS-VALIDATION
+# ============================================================================
 
-def evaluate_model_performance():
+class TimeAwareCV:
     """
-    Evaluate model performance using multiple metrics.
-    
-    Metrics:
-    - ROC AUC
-    - PRC AUC
-    - Accuracy
-    - Precision
-    - Recall
-    - F1-Score
+    Time-aware cross-validation strategies for longitudinal data.
     """
-    print("\nStep 9: Model performance evaluation...")
     
-    metrics = ['ROC_AUC', 'PRC_AUC', 'Accuracy', 'Precision', 'Recall', 'F1-Score']
+    def __init__(self, config=Config):
+        self.config = config
     
-    for metric in metrics:
-        print(f"Evaluating {metric}...")
+    def fixed_split_validation(self, df):
+        """
+        Fixed split validation: Train on early waves, test on later waves.
+        
+        Args:
+            df (pd.DataFrame): Longitudinal data
+            
+        Returns:
+            dict: Validation results
+        """
+        print("\nPerforming fixed split validation...")
+        
+        # Split data
+        train_data = df[df[self.config.WAVE_COLUMN].isin([1])]
+        val_data = df[df[self.config.WAVE_COLUMN].isin([2])]
+        test_data = df[df[self.config.WAVE_COLUMN].isin([3])]
+        external_val_data = df[df[self.config.WAVE_COLUMN].isin([4])]
+        
+        results = {
+            'train_waves': [1],
+            'validation_waves': [2],
+            'test_waves': [3],
+            'external_validation_waves': [4]
+        }
+        
+        print(f"Train waves: {results['train_waves']}")
+        print(f"Validation waves: {results['validation_waves']}")
+        print(f"Test waves: {results['test_waves']}")
+        print(f"External validation waves: {results['external_validation_waves']}")
+        
+        return results
     
-    print("Model performance evaluation completed.")
+    def sliding_window_validation(self, df):
+        """
+        Sliding window validation: Train on expanding windows.
+        
+        Args:
+            df (pd.DataFrame): Longitudinal data
+            
+        Returns:
+            list: Validation results for each window
+        """
+        print("\nPerforming sliding window validation...")
+        
+        results = []
+        max_wave = df[self.config.WAVE_COLUMN].max()
+        
+        for i in range(1, max_wave):
+            train_waves = list(range(1, i + 1))
+            test_wave = i + 1
+            
+            if test_wave <= max_wave:
+                result = {
+                    'window': i,
+                    'train_waves': train_waves,
+                    'test_wave': test_wave
+                }
+                results.append(result)
+                print(f"Window {i}: Train on waves {train_waves}, Test on wave {test_wave}")
+        
+        return results
+    
+    def cumulative_learning_validation(self, df):
+        """
+        Cumulative learning validation: Accumulate data over time.
+        
+        Args:
+            df (pd.DataFrame): Longitudinal data
+            
+        Returns:
+            list: Validation results for each round
+        """
+        print("\nPerforming cumulative learning validation...")
+        
+        results = []
+        max_wave = df[self.config.WAVE_COLUMN].max()
+        
+        for i in range(1, max_wave):
+            train_waves = list(range(1, i + 1))
+            test_wave = i + 1
+            
+            if test_wave <= max_wave:
+                result = {
+                    'round': i,
+                    'train_waves': train_waves,
+                    'test_wave': test_wave
+                }
+                results.append(result)
+                print(f"Round {i}: Train on waves {train_waves}, Test on wave {test_wave}")
+        
+        return results
+
+# ============================================================================
+# MODEL EVALUATION
+# ============================================================================
+
+class ModelEvaluator:
+    """
+    Comprehensive model evaluation using multiple metrics.
+    """
+    
+    def __init__(self, config=Config):
+        self.config = config
+        self.metrics = [
+            'roc_auc', 'prc_auc', 'accuracy', 'precision', 'recall', 'f1_score'
+        ]
+    
+    def evaluate_model(self, y_true, y_pred, y_pred_proba):
+        """
+        Evaluate model performance using multiple metrics.
+        
+        Args:
+            y_true (array-like): True labels
+            y_pred (array-like): Predicted labels
+            y_pred_proba (array-like): Predicted probabilities
+            
+        Returns:
+            dict: Evaluation metrics
+        """
+        metrics = {}
+        
+        # ROC AUC
+        try:
+            metrics['roc_auc'] = roc_auc_score(y_true, y_pred_proba)
+        except:
+            metrics['roc_auc'] = np.nan
+        
+        # Precision-Recall AUC
+        try:
+            precision, recall, _ = precision_recall_curve(y_true, y_pred_proba)
+            metrics['prc_auc'] = auc(recall, precision)
+        except:
+            metrics['prc_auc'] = np.nan
+        
+        # Classification metrics
+        metrics['accuracy'] = accuracy_score(y_true, y_pred)
+        metrics['precision'] = precision_score(y_true, y_pred, zero_division=0)
+        metrics['recall'] = recall_score(y_true, y_pred, zero_division=0)
+        metrics['f1_score'] = f1_score(y_true, y_pred, zero_division=0)
+        
+        return metrics
+    
+    def print_evaluation_results(self, results, model_name="Model"):
+        """
+        Print evaluation results in a formatted way.
+        
+        Args:
+            results (dict): Evaluation metrics
+            model_name (str): Name of the model
+        """
+        print(f"\n{model_name} Results:")
+        print("-" * 40)
+        for metric, value in results.items():
+            if not np.isnan(value):
+                print(f"{metric.upper()}: {value:.4f}")
+            else:
+                print(f"{metric.upper()}: N/A")
+
+# ============================================================================
+# MAIN EXECUTION FRAMEWORK
+# ============================================================================
+
+class LongitudinalPredictor:
+    """
+    Main framework for longitudinal prediction in N-wave cohort studies.
+    """
+    
+    def __init__(self, config=Config):
+        self.config = config
+        self.processor = LongitudinalDataProcessor(config)
+        self.feature_selector = FeatureSelector(config)
+        self.models = PredictionModels(config)
+        self.cv = TimeAwareCV(config)
+        self.evaluator = ModelEvaluator(config)
+    
+    def run_complete_pipeline(self, data_file_path=None):
+        """
+        Execute the complete prediction pipeline.
+        
+        Args:
+            data_file_path (str): Path to input data file (optional)
+        """
+        print("=" * 80)
+        print("LONGITUDINAL PREDICTION PIPELINE FOR N-WAVE COHORT STUDIES")
+        print("=" * 80)
+        
+        try:
+            # Step 1: Data Processing
+            if data_file_path:
+                df_long = self.processor.load_and_transform_data(data_file_path)
+            else:
+                print("No data file provided. Demonstrating pipeline structure.")
+                df_long = self._create_sample_data()
+            
+            df_clean = self.processor.clean_and_process_target(df_long)
+            df_imputed = self.processor.fill_missing_values(df_clean)
+            df_standardized = self.processor.standardize_features(df_imputed)
+            
+            # Step 2: Feature Preparation
+            X, y = self._prepare_features_and_target(df_standardized)
+            
+            # Step 3: Feature Selection
+            X_selected = self.feature_selector.select_features(X, y)
+            
+            # Step 4: Model Training
+            self.models.train_models(X_selected, y)
+            
+            # Step 5: Cross-Validation Strategies
+            self._perform_cross_validation(df_standardized)
+            
+            # Step 6: Model Evaluation
+            self._evaluate_models(X_selected, y)
+            
+            print("\n" + "=" * 80)
+            print("PIPELINE COMPLETED SUCCESSFULLY")
+            print("=" * 80)
+            
+        except Exception as e:
+            print(f"\nError in pipeline execution: {str(e)}")
+            print("Pipeline execution failed.")
+    
+    def _create_sample_data(self):
+        """
+        Create sample data for demonstration purposes.
+        
+        Returns:
+            pd.DataFrame: Sample longitudinal data
+        """
+        # Create dummy data for demonstration
+        np.random.seed(self.config.RANDOM_STATE)
+        n_individuals = 1000
+        n_waves = 4
+        
+        data = []
+        for i in range(n_individuals):
+            individual_id = f"ID_{i:04d}"
+            for wave in range(1, n_waves + 1):
+                row = {
+                    self.config.ID_COLUMN: individual_id,
+                    self.config.WAVE_COLUMN: wave,
+                    'Age': np.random.randint(10, 18),
+                    'Gender': np.random.choice([0, 1]),
+                    'Grade': np.random.randint(3, 10),
+                    'BMI': np.random.normal(22, 3),
+                    'Family_Income': np.random.normal(50000, 20000),
+                    self.config.TARGET_VAR: np.random.choice([0, 1], p=[0.7, 0.3])
+                }
+                data.append(row)
+        
+        return pd.DataFrame(data)
+    
+    def _prepare_features_and_target(self, df):
+        """
+        Prepare feature matrix and target vector.
+        
+        Args:
+            df (pd.DataFrame): Processed data
+            
+        Returns:
+            tuple: (X, y) Feature matrix and target vector
+        """
+        # Exclude ID, wave, and target from features
+        exclude_cols = [self.config.ID_COLUMN, self.config.WAVE_COLUMN, self.config.TARGET_VAR]
+        feature_cols = [col for col in df.columns if col not in exclude_cols]
+        
+        X = df[feature_cols]
+        y = df[self.config.TARGET_VAR]
+        
+        print(f"\nFeature matrix shape: {X.shape}")
+        print(f"Target vector shape: {y.shape}")
+        print(f"Target distribution: {y.value_counts().to_dict()}")
+        
+        return X, y
+    
+    def _perform_cross_validation(self, df):
+        """
+        Perform all cross-validation strategies.
+        
+        Args:
+            df (pd.DataFrame): Longitudinal data
+        """
+        print("\n" + "=" * 60)
+        print("CROSS-VALIDATION STRATEGIES")
+        print("=" * 60)
+        
+        # Fixed split validation
+        self.cv.fixed_split_validation(df)
+        
+        # Sliding window validation
+        self.cv.sliding_window_validation(df)
+        
+        # Cumulative learning validation
+        self.cv.cumulative_learning_validation(df)
+    
+    def _evaluate_models(self, X, y):
+        """
+        Evaluate all trained models.
+        
+        Args:
+            X (pd.DataFrame): Feature matrix
+            y (pd.Series): Target vector
+        """
+        print("\n" + "=" * 60)
+        print("MODEL EVALUATION")
+        print("=" * 60)
+        
+        # Make predictions with all models
+        predictions = self.models.predict(X)
+        
+        # Evaluate each model
+        for model_name in self.models.trained_models.keys():
+            pred_key = f"{model_name}_pred"
+            prob_key = f"{model_name}_prob"
+            
+            if pred_key in predictions and prob_key in predictions:
+                results = self.evaluator.evaluate_model(
+                    y, predictions[pred_key], predictions[prob_key]
+                )
+                self.evaluator.print_evaluation_results(results, model_name)
 
 # ============================================================================
 # MAIN EXECUTION
@@ -255,28 +699,13 @@ def evaluate_model_performance():
 
 def main():
     """
-    Execute the complete NSSI prediction pipeline.
+    Main execution function.
     """
-    print("=" * 80)
-    print("LONGITUDINAL NSSI PREDICTION PIPELINE")
-    print("=" * 80)
+    # Initialize predictor
+    predictor = LongitudinalPredictor()
     
-    # Data Processing Pipeline
-    load_and_transform_data()
-    clean_and_process_nssi()
-    fill_missing_values()
-    impute_remaining_missing()
-    
-    # Prediction Modeling Pipeline
-    prepare_features_for_modeling()
-    lstm_temporal_feature_selection()
-    random_forest_classification()
-    time_cross_validation()
-    evaluate_model_performance()
-    
-    print("\n" + "=" * 80)
-    print("PIPELINE COMPLETED SUCCESSFULLY")
-    print("=" * 80)
+    # Run complete pipeline
+    predictor.run_complete_pipeline()
 
 if __name__ == "__main__":
     main()
